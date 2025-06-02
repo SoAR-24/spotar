@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>AR Aircraft Tracker</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+        }
+        #arContent {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+        }
+        #compass {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            width: 100px;
+            height: 100px;
+            background: rgba(0, 0, 0, 0.5);
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        #compass::after {
+            content: '';
+            position: absolute;
+            width: 4px;
+            height: 50%;
+            background: red;
+            transform-origin: bottom center;
+        }
+        #info {
+            position: fixed;
+            bottom: 20px;
+            left: 20px;
+            background: rgba(0, 0, 0, 0.7);
+            color: white;
+            padding: 10px;
+            border-radius: 5px;
+            font-family: Arial, sans-serif;
+            display: none;
+        }
+        #startButton {
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            padding: 15px 30px;
+            background: #2196F3;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            font-size: 18px;
+            cursor: pointer;
+        }
+    </style>
+</head>
+<body>
+    <canvas id="arContent"></canvas>
+    <div id="compass"></div>
+    <div id="info"></div>
+    <button id="startButton">Start AR Experience</button>
+
+    <script type="module">
+        import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.157.0/build/three.module.js';
+        import { GLTFLoader } from 'https://cdn.jsdelivr.net/npm/three@0.157.0/examples/jsm/loaders/GLTFLoader.js';
+
+        let camera, scene, renderer, xrRefSpace;
+        let aircraftModels = new Map();
+        let currentPosition = null;
+        let compass;
+        let infoPanel;
+        
+        // Initialize the AR application
+        async function init() {
+            scene = new THREE.Scene();
+            camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+            
+            // Set up renderer
+            renderer = new THREE.WebGLRenderer({
+                antialias: true,
+                alpha: true,
+                canvas: document.querySelector('#arContent')
+            });
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.xr.enabled = true;
+
+            // Add ambient light
+            const ambientLight = new THREE.AmbientLight(0xffffff, 1.0);
+            scene.add(ambientLight);
+
+            // Get DOM elements
+            compass = document.getElementById('compass');
+            infoPanel = document.getElementById('info');
+
+            // Set up AR session
+            document.getElementById('startButton').addEventListener('click', startAR);
+
+            // Initialize device orientation for compass
+            initCompass();
+
+            // Start position tracking
+            await initGeolocation();
+
+            // Start aircraft data updates
+            updateAircraftData();
+            setInterval(updateAircraftData, 10000); // Update every 10 seconds
+
+            // Handle window resize
+            window.addEventListener('resize', onWindowResize, false);
+        }
+
+        // Initialize compass functionality
+        function initCompass() {
+            window.addEventListener('deviceorientationabsolute', (event) => {
+                const rotation = event.alpha;
+                if (rotation !== null) {
+                    compass.style.transform = `rotate(${360 - rotation}deg)`;
+                }
+            });
+        }
+
+        // Initialize geolocation tracking
+        async function initGeolocation() {
+            if ('geolocation' in navigator) {
+                navigator.geolocation.watchPosition(
+                    (position) => {
+                        currentPosition = {
+                            latitude: position.coords.latitude,
+                            longitude: position.coords.longitude,
+                            altitude: position.coords.altitude || 0
+                        };
+                    },
+                    (error) => console.error('Geolocation error:', error),
+                    {
+                        enableHighAccuracy: true,
+                        maximumAge: 0,
+                        timeout: 5000
+                    }
+                );
+            }
+        }
+
+        // Fetch aircraft data from OpenSky Network
+        async function updateAircraftData() {
+            if (!currentPosition) return;
+
+            const bbox = {
+                min_latitude: currentPosition.latitude - 1,
+                max_latitude: currentPosition.latitude + 1,
+                min_longitude: currentPosition.longitude - 1,
+                max_longitude: currentPosition.longitude + 1
+            };
+
+            try {
+                const response = await fetch(
+                    `https://opensky-network.org/api/states/all?` +
+                    `lamin=${bbox.min_latitude}&lomin=${bbox.min_longitude}&` +
+                    `lamax=${bbox.max_latitude}&lomax=${bbox.max_longitude}`
+                );
+                const data = await response.json();
+                updateAircraftModels(data.states || []);
+            } catch (error) {
+                console.error('Error fetching aircraft data:', error);
+            }
+        }
+
+        // Update 3D aircraft models
+        function updateAircraftModels(aircraftStates) {
+            // Remove old aircraft
+            aircraftModels.forEach((model, icao24) => {
+                if (!aircraftStates.find(state => state[0] === icao24)) {
+                    scene.remove(model);
+                    aircraftModels.delete(icao24);
+                }
+            });
+
+            // Update or add new aircraft
+            aircraftStates.forEach(state => {
+                const [icao24, callsign, origin, timestamp, longitude, latitude, altitude, 
+                      onGround, velocity, heading] = state;
+
+                if (!aircraftModels.has(icao24)) {
+                    // Create new aircraft model
+                    const geometry = new THREE.ConeGeometry(0.2, 0.5, 3);
+                    const material = new THREE.MeshPhongMaterial({ color: 0x00ff00 });
+                    const aircraft = new THREE.Mesh(geometry, material);
+                    
+                    aircraft.userData = {
+                        icao24,
+                        callsign,
+                        origin,
+                        velocity,
+                        altitude
+                    };
+
+                    scene.add(aircraft);
+                    aircraftModels.set(icao24, aircraft);
+                }
+
+                // Update aircraft position
+                const aircraft = aircraftModels.get(icao24);
+                const position = calculateAircraftPosition(latitude, longitude, altitude);
+                aircraft.position.set(position.x, position.y, position.z);
+                aircraft.rotation.y = THREE.MathUtils.degToRad(heading);
+            });
+        }
+
+        // Calculate aircraft position relative to user
+        function calculateAircraftPosition(latitude, longitude, altitude) {
+            if (!currentPosition) return { x: 0, y: 0, z: 0 };
+
+            const R = 6371000; // Earth's radius in meters
+            const lat1 = currentPosition.latitude * Math.PI / 180;
+            const lat2 = latitude * Math.PI / 180;
+            const lon1 = currentPosition.longitude * Math.PI / 180;
+            const lon2 = longitude * Math.PI / 180;
+
+            const x = R * Math.cos(lat1) * (lon2 - lon1);
+            const z = R * (lat2 - lat1);
+            const y = altitude - (currentPosition.altitude || 0);
+
+            // Scale down for AR visualization
+            const scale = 0.00001;
+            return {
+                x: x * scale,
+                y: y * scale,
+                z: z * scale
+            };
+        }
+
+        // Handle window resize
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        // Start AR session
+        async function startAR() {
+            try {
+                const session = await navigator.xr.requestSession('immersive-ar', {
+                    requiredFeatures: ['hit-test', 'local-floor']
+                });
+
+                session.addEventListener('end', () => {
+                    document.getElementById('startButton').style.display = 'block';
+                });
+
+                renderer.xr.setSession(session);
+                document.getElementById('startButton').style.display = 'none';
+
+                session.addEventListener('select', onSelect);
+                xrRefSpace = await session.requestReferenceSpace('local-floor');
+
+                renderer.setAnimationLoop(render);
+            } catch (error) {
+                console.error('Error starting AR session:', error);
+                alert('AR not supported on this device');
+            }
+        }
+
+        // Handle selection of aircraft
+        function onSelect(event) {
+            const raycaster = new THREE.Raycaster();
+            const tempMatrix = new THREE.Matrix4();
+            tempMatrix.fromArray(event.frame.getPose(event.inputSource.targetRaySpace, xrRefSpace).transform.matrix);
+
+            raycaster.ray.origin.setFromMatrixPosition(tempMatrix);
+            raycaster.ray.direction.set(0, 0, -1).applyMatrix4(tempMatrix);
+
+            const intersects = raycaster.intersectObjects(scene.children);
+            
+            if (intersects.length > 0) {
+                const aircraft = intersects[0].object;
+                if (aircraft.userData) {
+                    showAircraftInfo(aircraft.userData);
+                }
+            }
+        }
+
+        // Display aircraft information
+        function showAircraftInfo(data) {
+            infoPanel.innerHTML = `
+                <h3>Aircraft Info</h3>
+                <p>Callsign: ${data.callsign}</p>
+                <p>ICAO24: ${data.icao24}</p>
+                <p>Origin: ${data.origin}</p>
+                <p>Altitude: ${Math.round(data.altitude)}m</p>
+                <p>Velocity: ${Math.round(data.velocity)}m/s</p>
+            `;
+            infoPanel.style.display = 'block';
+            setTimeout(() => {
+                infoPanel.style.display = 'none';
+            }, 5000);
+        }
+
+        // Render loop
+        function render(timestamp, frame) {
+            renderer.render(scene, camera);
+        }
+
+        // Initialize the application
+        init();
+    </script>
+</body>
+</html>
